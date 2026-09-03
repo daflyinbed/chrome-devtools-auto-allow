@@ -1,0 +1,12 @@
+[project]
+name = "chrome-devtools-auto-allow"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "capstone>=5.0.9",
+    "frida>=17.17.0",
+    "numpy>=2.5.2",
+    "pyelftools>=0.33",
+]
