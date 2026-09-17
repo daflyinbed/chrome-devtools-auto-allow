@@ -12,6 +12,12 @@ Usage:
 
 Chrome updates change the binary, so offsets are recomputed automatically via
 find_offsets.py whenever the build id changes.
+
+macOS notes:
+  - The code lives in the "Google Chrome Framework" dylib (arm64 slice).
+  - Attaching Frida to Chrome requires task_for_pid permission: run as root,
+    or give the Python interpreter the debugger entitlement once (see README),
+    e.g. an ad-hoc signed `com.apple.security.cs.debugger`.
 """
 
 from __future__ import annotations
@@ -27,11 +33,13 @@ import frida
 
 HERE = Path(__file__).parent
 OFFSETS_FILE = HERE / "offsets.json"
+IS_DARWIN = sys.platform == "darwin"
+MODULE_NAME = "Google Chrome Framework" if IS_DARWIN else "chrome"
 
 HOOK_JS = """
 'use strict';
 
-const BASE = Process.getModuleByName('chrome').base;
+const BASE = Process.getModuleByName('%MODULE%').base;
 const ACCEPT_DEBUGGING = BASE.add(OFFSET_ACCEPT_DEBUGGING);
 const ALLOW_VALUE = %ALLOW_VALUE%;
 
@@ -91,14 +99,11 @@ send('[auto-allow] hooked AcceptDebugging @ ' + ACCEPT_DEBUGGING +
 def load_offsets() -> dict:
     if OFFSETS_FILE.exists():
         data = json.loads(OFFSETS_FILE.read_text())
-        build_id = subprocess.run(
-            ["readelf", "-n", str(Path("/opt/google/chrome/chrome"))],
-            capture_output=True, text=True,
-        ).stdout
-        # cheap check: reuse cache when the build id line matches
-        import re
-        m = re.search(r"[0-9a-f]{40}", build_id)
-        if m and data.get("build_id") == m.group(0):
+        build_id = None
+        import find_offsets
+
+        build_id = find_offsets.current_build_id()
+        if build_id and data.get("build_id") == build_id:
             return data["offsets"]
     print("[*] offsets missing/stale, resolving...")
     import find_offsets
@@ -111,6 +116,39 @@ def load_offsets() -> dict:
 def browser_pids() -> list[int]:
     """Main browser processes: chrome without --type= whose parent is not
     chrome itself (zygotes/renderers are sandboxed children with --type=)."""
+    if IS_DARWIN:
+        return browser_pids_darwin()
+    return browser_pids_linux()
+
+
+def browser_pids_darwin() -> list[int]:
+    import re
+
+    out = subprocess.run(
+        ["ps", "-axo", "pid=,ppid=,args="], capture_output=True, text=True
+    ).stdout
+    # Executable path may itself contain spaces ("Google Chrome"), so match
+    # against the whole argv instead of tokenising it.
+    main_re = re.compile(r"^/.*?\.app/Contents/MacOS/Google Chrome(?: |$)")
+    pids: dict[int, tuple[int, str]] = {}
+    for line in out.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        parts = line.split(None, 2)
+        if len(parts) < 3:
+            continue
+        pid_s, ppid_s, args = parts
+        if main_re.match(args):
+            pids[int(pid_s)] = (int(ppid_s), args)
+    return [
+        pid
+        for pid, (ppid, args) in pids.items()
+        if "--type=" not in args and ppid not in pids
+    ]
+
+
+def browser_pids_linux() -> list[int]:
     info = {}
     for proc in Path("/proc").iterdir():
         if not proc.name.isdigit():
@@ -121,7 +159,9 @@ def browser_pids() -> list[int]:
                 continue
             cmd = (proc / "cmdline").read_bytes().split(b"\0")
             status = (proc / "status").read_text()
-            ppid = int(next(l for l in status.splitlines() if l.startswith("PPid:")).split()[1])
+            ppid = int(
+                next(l for l in status.splitlines() if l.startswith("PPid:")).split()[1]
+            )
             info[int(proc.name)] = (ppid, any(a.startswith(b"--type=") for a in cmd))
         except (OSError, PermissionError, StopIteration):
             continue
@@ -147,7 +187,8 @@ def main() -> int:
         sys.exit("no running Chrome browser process found")
     print(f"[*] browser process(es): {pids}")
 
-    js = HOOK_JS.replace("%ALLOW_VALUE%", str(offsets.get("allow_value", 1)))
+    js = HOOK_JS.replace("%MODULE%", MODULE_NAME)
+    js = js.replace("%ALLOW_VALUE%", str(offsets.get("allow_value", 1)))
     js = js.replace("OFFSET_ACCEPT_DEBUGGING", str(offsets["accept_debugging"]))
 
     sessions = []
@@ -156,9 +197,20 @@ def main() -> int:
             session = frida.attach(pid)
         except Exception as e:
             print(f"[!] attach {pid} failed: {e}")
+            if IS_DARWIN:
+                print("    hint: macOS needs task_for_pid permission. Run with sudo or")
+                print(
+                    "    codesign the python interpreter with com.apple.security.cs.debugger"
+                )
+                print("    (see README).")
             continue
         script = session.create_script(js)
-        script.on("message", lambda msg, _pid=pid: print(f"[chrome:{_pid}] {msg.get('payload', msg)}"))
+        script.on(
+            "message",
+            lambda msg, _data=None, _pid=pid: print(
+                f"[chrome:{_pid}] {msg.get('payload', msg)}"
+            ),
+        )
         script.load()
         sessions.append(session)
         print(f"[+] hooked pid {pid}")
